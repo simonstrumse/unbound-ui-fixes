@@ -1,3 +1,4 @@
+// Game Component - v1.1 - Improved UI visibility
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams, useNavigate, Link } from 'react-router-dom';
 import { 
