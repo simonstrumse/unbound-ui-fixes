@@ -98,18 +98,73 @@ const Game: React.FC = () => {
     return () => window.removeEventListener('resize', checkMobile);
   }, []);
 
-  // Auto-scroll to bottom when new messages arrive
-  const scrollToBottom = useCallback(() => {
-    if (messagesEndRef.current) {
-      messagesEndRef.current.scrollIntoView({ behavior: 'smooth' });
-    }
-  }, []);
+  // Subscribe to realtime updates
+  useEffect(() => {
+    if (!sessionId || !user) return;
+
+    console.log('Setting up realtime subscription for session:', sessionId);
+
+    const channel = supabase.channel(`game:${sessionId}`)
+      .on(
+        'postgres_changes',
+        {
+          event: 'INSERT',
+          schema: 'public',
+          table: 'messages',
+          filter: `session_id=eq.${sessionId}`
+        },
+        (payload) => {
+          console.log('New message received:', payload);
+          const newMessage = payload.new as Message;
+          
+          // Only add if it's not from us and not already in the list
+          if (newMessage.user_id !== user.id && !messages.find(m => m.id === newMessage.id)) {
+            setMessages(prev => [...prev, newMessage]);
+          }
+        }
+      )
+      .on(
+        'postgres_changes',
+        {
+          event: 'UPDATE',
+          schema: 'public',
+          table: 'story_sessions',
+          filter: `id=eq.${sessionId}`
+        },
+        (payload) => {
+          console.log('Session updated:', payload);
+          const updatedSession = payload.new as StorySession;
+          setSession(updatedSession);
+          
+          // Update state from session
+          if (updatedSession.session_state) {
+            const state = updatedSession.session_state;
+            if (state.memory_events) setMemoryEvents(state.memory_events);
+            if (state.character_relationships) setRelationships(state.character_relationships);
+            if (state.world_state) setWorldState(state.world_state);
+          }
+        }
+      )
+      .subscribe();
+
+    return () => {
+      console.log('Cleaning up realtime subscription');
+      supabase.removeChannel(channel);
+    };
+  }, [sessionId, user, messages]);
 
   // Scroll to bottom when messages change
   useEffect(() => {
-    const timer = setTimeout(scrollToBottom, 100);
-    return () => clearTimeout(timer);
-  }, [messages, scrollToBottom]);
+    scrollToBottom();
+  }, [messages]);
+
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  };
+
+  // Toggle functions
+  const toggleLeftSidebar = () => setLeftSidebarCollapsed(!leftSidebarCollapsed);
+  const toggleRightSidebar = () => setRightSidebarCollapsed(!rightSidebarCollapsed);
 
   // Load session data
   useEffect(() => {
@@ -121,78 +176,58 @@ const Game: React.FC = () => {
     }
 
     if (!user) {
-      console.log('No user found, redirecting to signin');
-      navigate('/signin');
+      console.error('No user found');
+      setError('Please sign in to continue');
+      setLoading(false);
       return;
     }
 
-    fetchSessionData();
-  }, [sessionId, user, navigate]);
+    loadSessionData();
+  }, [sessionId, user]);
 
-  const fetchSessionData = async () => {
+  const loadSessionData = async () => {
     if (!sessionId || !user) return;
 
     try {
-      console.log('Fetching session data for:', sessionId);
       setLoading(true);
       setError(null);
 
-      // Fetch session with related data
+      console.log('Loading session data for:', sessionId);
+
+      // Load session with related data
       const { data: sessionData, error: sessionError } = await supabase
         .from('story_sessions')
-        .select('*')
+        .select(`
+          *,
+          stories (*),
+          characters (*)
+        `)
         .eq('id', sessionId)
         .eq('user_id', user.id)
         .single();
 
-      if (sessionError) {
-        console.error('Error fetching session:', sessionError);
-        throw new Error('Session not found or access denied');
+      if (sessionError || !sessionData) {
+        console.error('Failed to load session:', sessionError);
+        setError('Session not found or you don\'t have access to it');
+        return;
       }
 
-      if (!sessionData) {
-        throw new Error('Session not found');
-      }
+      console.log('Session loaded:', sessionData);
 
-      console.log('Session data loaded:', sessionData);
+      // Set the data
       setSession(sessionData);
-
-      // Extract world state from session
-      if (sessionData.session_state?.world_state) {
-        setWorldState(sessionData.session_state.world_state);
+      setStory(sessionData.stories);
+      setCharacter(sessionData.characters);
+      
+      // Load state from session
+      if (sessionData.session_state) {
+        const state = sessionData.session_state;
+        if (state.memory_events) setMemoryEvents(state.memory_events);
+        if (state.character_relationships) setRelationships(state.character_relationships);
+        if (state.world_state) setWorldState(state.world_state);
       }
 
-      // Fetch story
-      const { data: storyData, error: storyError } = await supabase
-        .from('stories')
-        .select('*')
-        .eq('id', sessionData.story_id)
-        .single();
-
-      if (storyError) {
-        console.error('Error fetching story:', storyError);
-        throw new Error('Story not found');
-      }
-
-      console.log('Story data loaded:', storyData);
-      setStory(storyData);
-
-      // Fetch character
-      const { data: characterData, error: characterError } = await supabase
-        .from('characters')
-        .select('*')
-        .eq('id', sessionData.player_character_id)
-        .single();
-
-      if (characterError) {
-        console.error('Error fetching character:', characterError);
-        throw new Error('Character not found');
-      }
-
-      console.log('Character data loaded:', characterData);
-      setCharacter(characterData);
-
-      // Fetch messages
+      // Load messages
       const { data: messagesData, error: messagesError } = await supabase
         .from('messages')
         .select('*')
@@ -200,290 +235,269 @@ const Game: React.FC = () => {
         .order('created_at', { ascending: true });
 
       if (messagesError) {
-        console.error('Error fetching messages:', messagesError);
-        throw new Error('Failed to load conversation history');
-      }
-
-      console.log('Messages loaded:', messagesData?.length || 0);
-      setMessages(messagesData || []);
-
-      // Load enhanced data from session state
-      if (sessionData.session_state) {
-        const state = sessionData.session_state;
-        if (state.memory_events) setMemoryEvents(state.memory_events);
-        if (state.relationships) setRelationships(state.relationships);
+        console.error('Failed to load messages:', messagesError);
+      } else {
+        console.log('Messages loaded:', messagesData?.length || 0);
+        setMessages(messagesData || []);
       }
 
     } catch (err) {
-      console.error('Error in fetchSessionData:', err);
-      const errorMessage = err instanceof Error ? err.message : 'Failed to load session data';
-      setError(errorMessage);
-      showNotification(errorMessage, 'error');
+      console.error('Error loading session:', err);
+      setError('Failed to load game session');
     } finally {
       setLoading(false);
     }
   };
 
-  const handleSendMessage = async () => {
-    if (!input.trim() || sending || !session || !story || !character) {
+  const handleCreativityLevelChange = useCallback(async (newLevel: 'faithful' | 'balanced' | 'creative') => {
+    if (!session || !user || session.creativity_level === newLevel) {
+      setStoryFreedomOpen(false);
       return;
     }
+
+    try {
+      console.log('Updating creativity level to:', newLevel);
+
+      const { error } = await supabase
+        .from('story_sessions')
+        .update({ 
+          creativity_level: newLevel,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', session.id)
+        .eq('user_id', user.id);
+
+      if (error) throw error;
+
+      setSession({ ...session, creativity_level: newLevel });
+      setStoryFreedomOpen(false);
+      showNotification(`Story freedom changed to ${getCreativityLevelDisplay(newLevel).name}`, 'success');
+
+    } catch (err) {
+      console.error('Error updating creativity level:', err);
+      showNotification('Failed to update story freedom', 'error');
+    }
+  }, [session, user, showNotification]);
+
+  const getCreativityLevelDisplay = (level?: 'faithful' | 'balanced' | 'creative') => {
+    const currentLevel = level || session?.creativity_level || 'balanced';
+    
+    switch (currentLevel) {
+      case 'faithful':
+        return {
+          name: 'Story-Focused',
+          description: 'Staying true to the original narrative',
+          icon: '📖'
+        };
+      case 'balanced':
+        return {
+          name: 'Flexible Exploration',
+          description: 'Balanced adventure with creative possibilities',
+          icon: '⚖️'
+        };
+      case 'creative':
+        return {
+          name: 'Open World',
+          description: 'Complete creative freedom',
+          icon: '🚀'
+        };
+      default:
+        return {
+          name: 'Flexible Exploration',
+          description: 'Balanced adventure with creative possibilities',
+          icon: '⚖️'
+        };
+    }
+  };
+
+  const sendMessage = async () => {
+    if (!input.trim() || !session || !character || !story || !user || sending) return;
 
     const userMessage = input.trim();
     setInput('');
     setSending(true);
-    setAutoSaveStatus('saving');
 
     try {
-      console.log('Sending message:', userMessage);
-
-      // Add user message to UI immediately
-      const tempUserMessage: Message = {
-        id: `temp-${Date.now()}`,
-        session_id: sessionId!,
-        character_id: character.id,
-        content: userMessage,
-        message_type: 'user',
-        metadata: {},
-        created_at: new Date().toISOString()
-      };
-
-      setMessages(prev => [...prev, tempUserMessage]);
-
-      // Save user message to database
-      const { data: savedUserMessage, error: userMessageError } = await supabase
+      // Create user message
+      const { data: newUserMessage, error: userError } = await supabase
         .from('messages')
         .insert({
-          session_id: sessionId!,
-          character_id: character.id,
+          session_id: session.id,
+          user_id: user.id,
           content: userMessage,
-          message_type: 'user',
-          metadata: {}
+          is_user: true,
+          order_index: messages.length
         })
         .select()
         .single();
 
-      if (userMessageError) {
-        console.error('Error saving user message:', userMessageError);
-        throw new Error('Failed to save your message');
-      }
+      if (userError) throw userError;
 
-      // Update the temporary message with the real one
-      setMessages(prev => 
-        prev.map(msg => 
-          msg.id === tempUserMessage.id ? savedUserMessage : msg
-        )
-      );
-
-      // Prepare conversation history for AI
-      const conversationHistory = [...messages, savedUserMessage].map(msg => ({
-        role: msg.message_type === 'user' ? 'user' as const : 'assistant' as const,
-        content: msg.content
-      }));
-
-      // Get creativity level
-      const creativityLevel = session.creativity_level === 'faithful' ? 1 : 
-                             session.creativity_level === 'creative' ? 3 : 2;
-
-      console.log('Calling AI service with creativity level:', creativityLevel);
+      // Update local state immediately
+      setMessages(prev => [...prev, newUserMessage]);
 
       // Call AI service
-      const aiResponse = await openaiService.continueConversation(
+      console.log('Calling OpenAI service...');
+      const result = await openaiService.generateStoryResponse({
+        messages: [...messages, newUserMessage],
         story,
         character,
-        conversationHistory,
-        userMessage,
-        creativityLevel,
+        session,
         memoryEvents,
-        worldState,
-        relationships
-      );
+        relationships,
+        worldState
+      });
 
-      console.log('AI response received:', aiResponse);
+      console.log('AI response received:', result);
 
-      // Clean the AI response
-      const cleanedResponse = validateAndCleanContent(aiResponse.response.response);
+      // Validate and clean the content
+      const cleanedContent = validateAndCleanContent(result.content);
 
-      // Create system message
-      const systemMessage: Message = {
-        id: `temp-system-${Date.now()}`,
-        session_id: sessionId!,
-        character_id: character.id,
-        content: cleanedResponse,
-        message_type: 'character',
-        metadata: {
-          suggested_actions: aiResponse.response.suggested_actions || [],
-          world_state_updates: aiResponse.response.world_state_updates || {},
-          memory_updates: aiResponse.response.memory_updates || [],
-          relationship_updates: aiResponse.response.relationship_updates || [],
-          tokens_used: aiResponse.tokensUsed || 0,
-          context_usage: aiResponse.response.context_usage || 0
-        },
-        created_at: new Date().toISOString()
-      };
-
-      // Add to UI immediately
-      setMessages(prev => [...prev, systemMessage]);
-
-      // Save system message to database
-      const { data: savedSystemMessage, error: systemMessageError } = await supabase
+      // Create AI message
+      const { data: aiMessage, error: aiError } = await supabase
         .from('messages')
         .insert({
-          session_id: sessionId!,
-          character_id: character.id,
-          content: cleanedResponse,
-          message_type: 'character',
-          metadata: systemMessage.metadata
+          session_id: session.id,
+          user_id: user.id,
+          content: cleanedContent,
+          is_user: false,
+          order_index: messages.length + 1
         })
         .select()
         .single();
 
-      if (systemMessageError) {
-        console.error('Error saving system message:', systemMessageError);
-        throw new Error('Failed to save AI response');
-      }
+      if (aiError) throw aiError;
 
-      // Update with saved message
-      setMessages(prev => 
-        prev.map(msg => 
-          msg.id === systemMessage.id ? savedSystemMessage : msg
-        )
-      );
+      setMessages(prev => [...prev, aiMessage]);
 
-      // Update enhanced state
-      if (aiResponse.response.memory_updates?.length > 0) {
-        setMemoryEvents(prev => [...prev, ...aiResponse.response.memory_updates]);
-      }
-
-      if (aiResponse.response.relationship_updates?.length > 0) {
-        setRelationships(prev => {
-          const updated = [...prev];
-          aiResponse.response.relationship_updates.forEach(update => {
-            const existingIndex = updated.findIndex(r => r.character_name === update.character_name);
-            if (existingIndex >= 0) {
-              updated[existingIndex] = { ...updated[existingIndex], ...update };
-            } else {
-              updated.push({
-                character_name: update.character_name,
-                relationship_type: update.relationship_type || 'neutral',
-                trust_level: update.trust_level || 50,
-                notes: update.notes || '',
-                last_interaction: new Date().toISOString()
-              });
-            }
-          });
-          return updated;
-        });
-      }
-
-      if (aiResponse.response.world_state_updates) {
-        setWorldState(prev => ({ ...prev, ...aiResponse.response.world_state_updates }));
-      }
-
-      // Save enhanced state to session
-      const enhancedState = {
+      // Update session state with new context info
+      const updatedState = {
         ...session.session_state,
-        memory_events: memoryEvents,
-        relationships: relationships,
-        world_state: worldState,
-        context_tokens_used: aiResponse.response.context_usage || 0
+        memory_events: result.memoryEvents || memoryEvents,
+        character_relationships: result.relationships || relationships,
+        world_state: result.worldState || worldState,
+        context_tokens_used: result.tokensUsed || 0,
+        last_summary: result.summary || session.session_state?.last_summary,
+        important_decisions: result.importantDecisions || session.session_state?.important_decisions || []
       };
 
-      await supabase
+      // Update local state
+      if (result.memoryEvents) setMemoryEvents(result.memoryEvents);
+      if (result.relationships) setRelationships(result.relationships);
+      if (result.worldState) setWorldState(result.worldState);
+
+      // Update session in database
+      const { error: updateError } = await supabase
         .from('story_sessions')
-        .update({ 
-          session_state: enhancedState,
+        .update({
+          session_state: updatedState,
           updated_at: new Date().toISOString()
         })
-        .eq('id', sessionId!);
+        .eq('id', session.id);
 
-      // Track API usage
-      if (aiResponse.usage) {
-        await supabase.from('api_usage').insert({
-          user_id: user.id,
-          session_id: sessionId!,
-          tokens_used: aiResponse.usage.totalTokens,
-          input_tokens: aiResponse.usage.inputTokens,
-          output_tokens: aiResponse.usage.outputTokens,
-          operation_type: 'continue_conversation',
-          model_type: aiResponse.usage.modelType,
-          response_time_ms: aiResponse.usage.responseTime,
-          input_cost: aiResponse.usage.costs.inputCost,
-          output_cost: aiResponse.usage.costs.outputCost,
-          total_cost: aiResponse.usage.costs.totalCost,
-          api_provider: 'openai'
-        });
+      if (updateError) {
+        console.error('Failed to update session state:', updateError);
       }
 
-      setAutoSaveStatus('saved');
-      setTimeout(() => setAutoSaveStatus('idle'), 2000);
+      // Update API usage tracking
+      if (result.tokensUsed > 0) {
+        await supabase
+          .from('api_usage')
+          .insert({
+            user_id: user.id,
+            session_id: session.id,
+            operation_type: 'story_response',
+            model_type: 'gpt-4o-mini',
+            tokens_used: result.tokensUsed,
+            cost_estimate: result.tokensUsed * 0.00003, // Rough estimate
+            response_time_ms: result.responseTime || 0
+          });
+      }
+
+      // Trigger auto-save
+      setAutoSaveStatus('saving');
+      setTimeout(() => setAutoSaveStatus('saved'), 1000);
+      setTimeout(() => setAutoSaveStatus('idle'), 3000);
 
     } catch (err) {
       console.error('Error sending message:', err);
-      const errorMessage = err instanceof Error ? err.message : 'Failed to send message';
-      setError(errorMessage);
-      showNotification(errorMessage, 'error');
-      setAutoSaveStatus('error');
-      setTimeout(() => setAutoSaveStatus('idle'), 3000);
+      showNotification('Failed to send message. Please try again.', 'error');
+      // Restore the input
+      setInput(userMessage);
     } finally {
       setSending(false);
     }
   };
 
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+  const handleKeyPress = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
-      handleSendMessage();
+      sendMessage();
     }
   };
 
-  const handleExport = () => {
-    setShowExportModal(true);
-  };
+  const regenerateLastResponse = async () => {
+    if (!session || messages.length < 2 || sending) return;
 
-  const formatTime = (dateString: string) => {
-    return new Date(dateString).toLocaleTimeString([], { 
-      hour: '2-digit', 
-      minute: '2-digit' 
-    });
-  };
+    // Find the last AI message
+    const lastAiMessageIndex = messages.findLastIndex(m => !m.is_user);
+    if (lastAiMessageIndex === -1) return;
 
-  const getCreativityLevelDisplay = () => {
-    switch (session?.creativity_level) {
-      case 'faithful': return { name: 'Story-Focused', description: 'Staying true to the original narrative' };
-      case 'creative': return { name: 'Open World', description: 'Complete creative freedom' };
-      default: return { name: 'Flexible Exploration', description: 'Balanced adventure with creative possibilities' };
-    }
-  };
-
-  const handleCreativityLevelChange = async (newLevel: 'faithful' | 'balanced' | 'creative') => {
-    if (!session) return;
+    setSending(true);
     
     try {
-      const { error } = await supabase
-        .from('story_sessions')
-        .update({ creativity_level: newLevel })
-        .eq('id', sessionId!);
+      // Get messages up to (but not including) the last AI message
+      const previousMessages = messages.slice(0, lastAiMessageIndex);
+      
+      // Call AI service again
+      const result = await openaiService.generateStoryResponse({
+        messages: previousMessages,
+        story: story!,
+        character: character!,
+        session,
+        memoryEvents,
+        relationships,
+        worldState,
+        regenerate: true
+      });
 
-      if (error) throw error;
+      // Validate and clean the content
+      const cleanedContent = validateAndCleanContent(result.content);
 
-      setSession(prev => prev ? { ...prev, creativity_level: newLevel } : null);
-      setStoryFreedomOpen(false);
-      showNotification(`Story freedom updated to ${getCreativityLevelDisplay().name}`, 'success');
+      // Update the last AI message
+      const { error: updateError } = await supabase
+        .from('messages')
+        .update({
+          content: cleanedContent,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', messages[lastAiMessageIndex].id);
+
+      if (updateError) throw updateError;
+
+      // Update local state
+      const updatedMessages = [...messages];
+      updatedMessages[lastAiMessageIndex] = {
+        ...updatedMessages[lastAiMessageIndex],
+        content: cleanedContent
+      };
+      setMessages(updatedMessages);
+
+      showNotification('Response regenerated', 'success');
     } catch (err) {
-      console.error('Error updating creativity level:', err);
-      showNotification('Failed to update story freedom level', 'error');
+      console.error('Error regenerating response:', err);
+      showNotification('Failed to regenerate response', 'error');
+    } finally {
+      setSending(false);
     }
   };
-
-  const toggleLeftSidebar = () => setLeftSidebarCollapsed(!leftSidebarCollapsed);
-  const toggleRightSidebar = () => setRightSidebarCollapsed(!rightSidebarCollapsed);
 
   if (loading) {
     return (
-      <div className="min-h-screen bg-gradient-to-br from-purple-900 via-purple-800 to-slate-900 flex items-center justify-center">
+      <div className="h-screen bg-gradient-to-br from-purple-900 via-purple-800 to-slate-900 flex items-center justify-center">
         <div className="text-center">
-          <div className="text-white text-xl mb-4 loading-dots">Loading your adventure</div>
+          <Loader2 className="w-12 h-12 text-white animate-spin mx-auto mb-4" />
+          <p className="text-white text-lg">Loading your adventure...</p>
         </div>
       </div>
     );
@@ -491,13 +505,17 @@ const Game: React.FC = () => {
 
   if (error || !session || !story || !character) {
     return (
-      <div className="min-h-screen bg-gradient-to-br from-purple-900 via-purple-800 to-slate-900 flex items-center justify-center">
-        <div className="text-center">
+      <div className="h-screen bg-gradient-to-br from-purple-900 via-purple-800 to-slate-900 flex items-center justify-center">
+        <div className="text-center max-w-md">
           <AlertCircle className="w-16 h-16 text-red-400 mx-auto mb-4" />
-          <h2 className="text-2xl font-medium text-white mb-2">Unable to Load Adventure</h2>
-          <p className="text-purple-100 mb-4 font-light">{error || 'Session data not found'}</p>
-          <Link to="/dashboard" className="text-purple-300 hover:text-white">
-            ← Back to Dashboard
+          <h2 className="text-2xl font-bold text-white mb-2">Unable to Load Game</h2>
+          <p className="text-purple-200 mb-6">{error || 'Failed to load game session'}</p>
+          <Link
+            to="/dashboard"
+            className="bg-white text-purple-900 px-6 py-3 rounded-lg font-medium hover:bg-purple-50 transition-colors inline-flex items-center gap-2"
+          >
+            <ArrowLeft className="w-5 h-5" />
+            Back to Dashboard
           </Link>
         </div>
       </div>
@@ -511,7 +529,7 @@ const Game: React.FC = () => {
   return (
     <div className="h-screen bg-gradient-to-br from-purple-900 via-purple-800 to-slate-900 flex flex-col overflow-hidden game-chat">
       {/* Header */}
-      <header className="bg-white/30 backdrop-blur-sm border-b border-white/30 flex-shrink-0">
+      <header className="bg-white/20 backdrop-blur-sm border-b border-white/30 flex-shrink-0">
         <div className="px-4 sm:px-6 lg:px-8 py-4">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-4">
@@ -529,67 +547,62 @@ const Game: React.FC = () => {
                   </span>
                 </div>
                 <div>
-                  <div className="text-white font-medium">{character.name}</div>
-                  <div className="text-purple-200 text-sm font-light">in {story.title}</div>
+                  <h1 className="text-lg font-semibold text-white">{character.name}</h1>
+                  <p className="text-sm text-purple-200">{story.title}</p>
                 </div>
               </div>
             </div>
             
-            {/* Mobile toggle buttons */}
-            {isMobile && (
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={toggleLeftSidebar}
-                  className="bg-white/10 hover:bg-white/20 text-white p-2 rounded-lg transition-colors"
-                  aria-label="Toggle character info"
-                >
-                  <User className="w-4 h-4" />
-                </button>
-                <button
-                  onClick={toggleRightSidebar}
-                  className="bg-white/10 hover:bg-white/20 text-white p-2 rounded-lg transition-colors"
-                  aria-label="Toggle game status"
-                >
-                  <Info className="w-4 h-4" />
-                </button>
-              </div>
-            )}
-            
-            {/* Desktop controls */}
-            {!isMobile && (
-              <div className="flex items-center gap-2">
-                <AutoSaveIndicator status={autoSaveStatus} />
-                <button
-                  onClick={() => setShowStoryInfo(true)}
-                  className="bg-white/10 hover:bg-white/20 text-white px-4 py-2 rounded-lg transition-colors flex items-center gap-2"
-                >
-                  <Info className="w-4 h-4" />
-                  Info
-                </button>
-                <button
-                  onClick={handleExport}
-                  className="bg-white/10 hover:bg-white/20 text-white px-4 py-2 rounded-lg transition-colors flex items-center gap-2"
-                >
-                  <Download className="w-4 h-4" />
-                  Export
-                </button>
-              </div>
-            )}
+            <div className="flex items-center gap-2">
+              {/* Mobile menu buttons */}
+              {isMobile && (
+                <>
+                  <button
+                    onClick={toggleLeftSidebar}
+                    className="bg-white/10 hover:bg-white/20 text-white p-2 rounded-lg transition-colors"
+                  >
+                    <User className="w-5 h-5" />
+                  </button>
+                  <button
+                    onClick={toggleRightSidebar}
+                    className="bg-white/10 hover:bg-white/20 text-white p-2 rounded-lg transition-colors"
+                  >
+                    <Activity className="w-5 h-5" />
+                  </button>
+                </>
+              )}
+              
+              {/* Action buttons */}
+              <button
+                onClick={() => setShowExportModal(true)}
+                className="bg-white/10 hover:bg-white/20 text-white px-4 py-2 rounded-lg transition-colors flex items-center gap-2"
+              >
+                <Download className="w-4 h-4" />
+                {!isMobile && 'Export'}
+              </button>
+              <button
+                onClick={() => setShowStoryInfo(!showStoryInfo)}
+                className="bg-white/10 hover:bg-white/20 text-white px-4 py-2 rounded-lg transition-colors flex items-center gap-2"
+              >
+                <Info className="w-4 h-4" />
+                {!isMobile && 'Info'}
+              </button>
+            </div>
           </div>
         </div>
       </header>
 
-      {/* Main Game Area */}
+      {/* Main content area */}
       <div className="flex-1 flex overflow-hidden">
         {/* Left Sidebar - Character Info */}
-        <div className={`bg-white/30 backdrop-blur-sm border-r border-white/30 flex-shrink-0 transition-all duration-300 ${
+        <div className={`bg-white/20 backdrop-blur-sm border-r border-white/30 flex-shrink-0 transition-all duration-300 ${
           leftSidebarCollapsed ? (isMobile ? 'w-0' : 'w-0') : 'w-80'
         } ${leftSidebarCollapsed ? 'overflow-hidden' : 'overflow-y-auto'}`}>
           <div className="p-6 space-y-6">
             {/* Character Header */}
-            <div className="bg-white/30 backdrop-blur-sm rounded-lg p-4 border border-white/20">
+            <div className="bg-white/20 backdrop-blur-sm rounded-lg p-4 border border-white/20">
               <div className="flex items-center justify-between mb-4">
-                <h3 className="text-lg font-medium text-white">{character.name}</h3>
+                <h3 className="text-lg font-medium text-white">Character Info</h3>
                 {!isMobile && (
                   <button
                     onClick={toggleLeftSidebar}
@@ -599,212 +612,212 @@ const Game: React.FC = () => {
                   </button>
                 )}
               </div>
-              <p className="text-purple-200 text-sm font-light">Your Character</p>
-            </div>
-
-            {/* Character Traits */}
-            <div className="bg-white/30 backdrop-blur-sm rounded-lg p-4 border border-white/20">
-              <div className="flex items-center gap-2 mb-4">
-                <Heart className="w-5 h-5 text-purple-300" />
-                <h4 className="text-white font-medium">Traits</h4>
-              </div>
-              {character.personality_traits && character.personality_traits.length > 0 ? (
-                <div className="flex flex-wrap gap-2">
-                  {character.personality_traits.map((trait, index) => (
-                    <span
-                      key={index}
-                      className="bg-purple-500/30 text-purple-100 px-3 py-1 rounded-full text-xs font-medium border border-purple-400/30"
-                    >
-                      {trait}
-                    </span>
-                  ))}
+              <div className="flex items-center gap-3">
+                <div className="w-12 h-12 bg-gradient-to-br from-purple-500 to-pink-500 rounded-full flex items-center justify-center">
+                  <span className="text-xl font-medium text-white">
+                    {character.name.charAt(0).toUpperCase()}
+                  </span>
                 </div>
-              ) : (
-                <p className="text-purple-200 text-sm font-light">No traits defined</p>
-              )}
-            </div>
-
-            {/* Conversation Count */}
-            <div className="bg-white/30 backdrop-blur-sm rounded-lg p-4 border border-white/20">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <MessageCircle className="w-5 h-5 text-purple-300" />
-                  <span className="text-white font-medium">Conversations</span>
+                <div>
+                  <p className="font-medium text-white">{character.name}</p>
+                  <p className="text-sm text-purple-200">Level {character.level || 1}</p>
                 </div>
-                <span className="text-2xl font-medium text-white">
-                  {messages.filter(m => m.message_type === 'user').length}
-                </span>
               </div>
             </div>
 
-            {/* Key Memories */}
-            <div className="bg-white/30 backdrop-blur-sm rounded-lg p-4 border border-white/20">
-              <div className="flex items-center justify-between mb-4">
-                <div className="flex items-center gap-2">
-                  <Sparkles className="w-5 h-5 text-purple-300" />
-                  <span className="text-white font-medium">Key Memories</span>
-                </div>
-                <span className="text-white font-medium">
-                  {memoryEvents.filter(e => e.importance === 'high').length}
-                </span>
+            {/* Traits */}
+            <div className="bg-white/20 backdrop-blur-sm rounded-lg p-4 border border-white/20">
+              <h4 className="text-white font-medium mb-3">Traits</h4>
+              <div className="space-y-2">
+                {character.traits.map((trait, index) => (
+                  <div key={index} className="flex items-start gap-2">
+                    <span className="text-purple-300 mt-1">•</span>
+                    <span className="text-purple-100 text-sm">{trait}</span>
+                  </div>
+                ))}
               </div>
-              {memoryEvents.length > 0 ? (
-                <div className="space-y-2">
-                  {memoryEvents.slice(-3).map((memory, index) => (
-                    <div key={index} className="p-2 bg-white/10 rounded border border-white/10">
-                      <p className="text-purple-100 text-sm font-light">{memory.description}</p>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <p className="text-purple-200 text-sm font-light">No key memories yet</p>
-              )}
             </div>
 
             {/* Relationships */}
-            <div className="bg-white/30 backdrop-blur-sm rounded-lg p-4 border border-white/20">
-              <div className="flex items-center justify-between mb-4">
-                <div className="flex items-center gap-2">
-                  <Users className="w-5 h-5 text-purple-300" />
-                  <span className="text-white font-medium">Relationships</span>
-                </div>
-                <span className="text-white font-medium">
-                  {relationships.length}
-                </span>
+            <div className="bg-white/20 backdrop-blur-sm rounded-lg p-4 border border-white/20">
+              <div className="flex items-center gap-2 mb-3">
+                <Heart className="w-5 h-5 text-purple-300" />
+                <h4 className="text-white font-medium">Relationships</h4>
               </div>
-              {relationships.length > 0 ? (
-                <div className="space-y-2">
-                  {relationships.slice(-4).map((rel, index) => (
-                    <div key={index} className="p-2 bg-white/10 rounded border border-white/10">
-                      <div className="flex items-center justify-between">
-                        <span className="text-white font-medium text-sm">{rel.character_name}</span>
-                        <span className="text-purple-200 text-xs">{rel.trust_level}%</span>
-                      </div>
-                      <p className="text-purple-200 text-xs font-light">{rel.relationship_type} • Trust: {rel.trust_level}%</p>
+              <div className="space-y-2">
+                {relationships.length > 0 ? (
+                  relationships.map((rel, index) => (
+                    <div key={index} className="text-sm">
+                      <span className="text-purple-100">{rel.character_name}</span>
+                      <span className="text-purple-200 ml-2">• {rel.relationship_level}</span>
                     </div>
-                  ))}
-                </div>
-              ) : (
-                <p className="text-purple-200 text-sm font-light">No relationships yet</p>
-              )}
+                  ))
+                ) : (
+                  <p className="text-purple-200 text-sm">No relationships formed yet</p>
+                )}
+              </div>
+            </div>
+
+            {/* Memory Events */}
+            <div className="bg-white/20 backdrop-blur-sm rounded-lg p-4 border border-white/20">
+              <div className="flex items-center gap-2 mb-3">
+                <Calendar className="w-5 h-5 text-purple-300" />
+                <h4 className="text-white font-medium">Key Memories</h4>
+              </div>
+              <div className="space-y-2">
+                {memoryEvents.slice(-5).map((event, index) => (
+                  <div key={index} className="text-sm">
+                    <p className="text-purple-100">{event.event_type}</p>
+                    <p className="text-purple-200 text-xs">{event.description}</p>
+                  </div>
+                ))}
+                {memoryEvents.length === 0 && (
+                  <p className="text-purple-200 text-sm">No memories yet</p>
+                )}
+              </div>
             </div>
           </div>
         </div>
 
-        {/* Main Chat Area */}
-        <div className="flex-1 flex flex-col">
-          {/* Messages Container - Fixed height with internal scrolling */}
+        {/* Center - Main Chat Area */}
+        <div className="flex-1 flex flex-col bg-transparent">
+          {/* Story info panel */}
+          {showStoryInfo && (
+            <div className="bg-white/10 backdrop-blur-sm border-b border-white/20 p-4">
+              <div className="max-w-4xl mx-auto">
+                <h3 className="text-lg font-medium text-white mb-2">{story.title}</h3>
+                <p className="text-purple-200 text-sm mb-3">{story.description}</p>
+                <div className="flex flex-wrap gap-4 text-sm">
+                  <span className="text-purple-300">Genre: {story.genre}</span>
+                  <span className="text-purple-300">Setting: {story.setting}</span>
+                  <span className="text-purple-300">Tone: {story.tone}</span>
+                  <span className="text-purple-300">Perspective: {story.perspective}</span>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Messages area */}
           <div 
             ref={messagesContainerRef}
             className="flex-1 overflow-y-auto p-4 space-y-4"
-            style={{ maxHeight: 'calc(100vh - 200px)' }}
           >
-            {messages.length === 0 ? (
-              <div className="text-center py-8">
-                <p className="text-purple-100 font-light">Your adventure begins...</p>
-              </div>
-            ) : (
-              messages.map((message) => (
-                <div key={message.id} className="space-y-2">
-                  <div className={`flex gap-3 ${
-                    message.message_type === 'user' ? 'justify-end' : 'justify-start'
-                  }`}>
-                    {message.message_type !== 'user' && (
-                      <div className="w-8 h-8 bg-gradient-to-br from-emerald-500 to-teal-500 rounded-full flex items-center justify-center flex-shrink-0">
-                        <MessageCircle className="w-4 h-4 text-white" />
-                      </div>
-                    )}
-                    <div className={`max-w-md lg:max-w-2xl p-4 rounded-lg border ${
-                      message.message_type === 'user'
-                        ? 'bg-purple-500 text-white border-purple-400 ml-12'
-                        : 'bg-white/10 text-purple-100 border-white/20 backdrop-blur-sm'
+            <div className="max-w-4xl mx-auto">
+              {messages.map((message, index) => (
+                <div
+                  key={message.id}
+                  className={`flex ${message.is_user ? 'justify-end' : 'justify-start'} mb-4`}
+                >
+                  <div className={`max-w-[80%] ${message.is_user ? 'order-2' : 'order-1'}`}>
+                    <div className={`rounded-lg p-4 ${
+                      message.is_user
+                        ? 'bg-purple-600 text-white'
+                        : 'bg-white/90 text-gray-800 backdrop-blur-sm'
                     }`}>
-                      <p className="whitespace-pre-wrap leading-relaxed font-light">
-                        {message.content}
-                      </p>
-                      <p className="text-xs mt-2 opacity-70 font-light">
-                        {formatTime(message.created_at)}
-                      </p>
+                      <p className="whitespace-pre-wrap">{message.content}</p>
                     </div>
-                    {message.message_type === 'user' && (
-                      <div className="w-8 h-8 bg-gradient-to-br from-purple-500 to-pink-500 rounded-full flex items-center justify-center flex-shrink-0">
-                        <span className="text-sm font-medium text-white">
-                          {character.name.charAt(0).toUpperCase()}
-                        </span>
-                      </div>
-                    )}
-                  </div>
-                  
-                  {/* Suggested Actions */}
-                  {message.message_type === 'character' && message.metadata?.suggested_actions && (
-                    <div className="flex flex-wrap gap-2 ml-11">
-                      {message.metadata.suggested_actions.slice(0, 3).map((action: any, index: number) => (
-                        <button
-                          key={index}
-                          onClick={() => setInput(action.text)}
-                          className="bg-white/10 hover:bg-white/20 text-purple-100 px-3 py-1 rounded text-sm transition-colors border border-white/20"
-                        >
-                          {action.text}
-                        </button>
-                      ))}
+                    <div className={`text-xs mt-1 ${
+                      message.is_user ? 'text-right text-purple-200' : 'text-left text-purple-300'
+                    }`}>
+                      {new Date(message.created_at).toLocaleTimeString([], { 
+                        hour: 'numeric', 
+                        minute: '2-digit' 
+                      })}
                     </div>
-                  )}
-                </div>
-              ))
-            )}
-            
-            {sending && (
-              <div className="flex gap-3">
-                <div className="w-8 h-8 bg-gradient-to-br from-emerald-500 to-teal-500 rounded-full flex items-center justify-center">
-                  <MessageCircle className="w-4 h-4 text-white" />
-                </div>
-                <div className="p-4 rounded-lg bg-white/10 border border-white/20 backdrop-blur-sm">
-                  <div className="flex items-center gap-2">
-                    <Loader2 className="w-4 h-4 text-purple-200 animate-spin" />
-                    <span className="text-purple-100 font-light loading-dots">Writing</span>
                   </div>
                 </div>
-              </div>
-            )}
-            
-            <div ref={messagesEndRef} />
+              ))}
+              
+              {sending && (
+                <div className="flex justify-start mb-4">
+                  <div className="bg-white/90 backdrop-blur-sm rounded-lg p-4">
+                    <div className="flex items-center gap-2">
+                      <Loader2 className="w-4 h-4 animate-spin text-purple-600" />
+                      <span className="text-gray-600">Thinking...</span>
+                    </div>
+                  </div>
+                </div>
+              )}
+              
+              <div ref={messagesEndRef} />
+            </div>
           </div>
 
-          {/* Input Area - Fixed at bottom */}
-          <div className="border-t border-white/20 p-4 bg-white/10 backdrop-blur-sm flex-shrink-0">
-            <div className="flex gap-2">
-              <textarea
-                ref={inputRef}
-                value={input}
-                onChange={(e) => setInput(e.target.value)}
-                onKeyDown={handleKeyDown}
-                placeholder={`What does ${character.name} do next?`}
-                className="flex-1 p-3 bg-white/10 border border-white/20 rounded-lg text-white placeholder-purple-300 resize-none focus:outline-none focus:ring-2 focus:ring-purple-400 backdrop-blur-sm"
-                rows={2}
-                disabled={sending}
-              />
-              <button
-                onClick={handleSendMessage}
-                disabled={!input.trim() || sending}
-                className="bg-purple-500 hover:bg-purple-600 disabled:bg-purple-400 disabled:opacity-50 text-white px-6 py-3 rounded-lg transition-colors flex items-center justify-center disabled:cursor-not-allowed"
-              >
-                <Send className="w-5 h-5" />
-              </button>
+          {/* Suggested actions */}
+          {!sending && messages.length > 0 && !messages[messages.length - 1].is_user && (
+            <div className="px-4 pb-2">
+              <div className="max-w-4xl mx-auto">
+                <div className="flex flex-wrap gap-2">
+                  {/* These could be dynamic based on context */}
+                  <button
+                    onClick={() => setInput('Look around')}
+                    className="bg-white/10 hover:bg-white/20 text-purple-100 px-3 py-1 rounded text-sm transition-colors border border-white/20"
+                  >
+                    Look around
+                  </button>
+                  <button
+                    onClick={() => setInput('Who else is here?')}
+                    className="bg-white/10 hover:bg-white/20 text-purple-100 px-3 py-1 rounded text-sm transition-colors border border-white/20"
+                  >
+                    Who's here?
+                  </button>
+                  <button
+                    onClick={() => setInput('What should I do next?')}
+                    className="bg-white/10 hover:bg-white/20 text-purple-100 px-3 py-1 rounded text-sm transition-colors border border-white/20"
+                  >
+                    What next?
+                  </button>
+                </div>
+              </div>
             </div>
-            <div className="flex justify-between items-center mt-2 text-xs text-purple-300 font-light">
-              <span>Press Ctrl+Enter to send</span>
-              <span>{Math.floor(currentContextUsage / 1000)}k / 128,000 tokens</span>
+          )}
+
+          {/* Input area */}
+          <div className="border-t border-white/20 bg-white/10 backdrop-blur-sm p-4">
+            <div className="max-w-4xl mx-auto">
+              <div className="flex gap-2">
+                <textarea
+                  ref={inputRef}
+                  value={input}
+                  onChange={(e) => setInput(e.target.value)}
+                  onKeyPress={handleKeyPress}
+                  placeholder="What would you like to do?"
+                  className="flex-1 bg-white/90 backdrop-blur-sm text-gray-800 rounded-lg px-4 py-3 resize-none focus:outline-none focus:ring-2 focus:ring-purple-500 placeholder-gray-500"
+                  rows={1}
+                  disabled={sending}
+                />
+                <button
+                  onClick={sendMessage}
+                  disabled={!input.trim() || sending}
+                  className="bg-purple-600 hover:bg-purple-700 disabled:bg-purple-400 text-white rounded-lg px-6 py-3 transition-colors flex items-center gap-2"
+                >
+                  {sending ? (
+                    <Loader2 className="w-5 h-5 animate-spin" />
+                  ) : (
+                    <Send className="w-5 h-5" />
+                  )}
+                </button>
+                {messages.length > 0 && !messages[messages.length - 1].is_user && !sending && (
+                  <button
+                    onClick={regenerateLastResponse}
+                    className="bg-white/10 hover:bg-white/20 text-white rounded-lg px-4 py-3 transition-colors"
+                    title="Regenerate last response"
+                  >
+                    <RefreshCw className="w-5 h-5" />
+                  </button>
+                )}
+              </div>
             </div>
           </div>
         </div>
 
         {/* Right Sidebar - Game Status */}
-        <div className={`bg-white/30 backdrop-blur-sm border-l border-white/20 flex-shrink-0 transition-all duration-300 ${
+        <div className={`bg-white/20 backdrop-blur-sm border-l border-white/20 flex-shrink-0 transition-all duration-300 ${
           rightSidebarCollapsed ? (isMobile ? 'w-0' : 'w-0') : 'w-80'
         } ${rightSidebarCollapsed ? 'overflow-hidden' : 'overflow-y-auto'}`}>
           <div className="p-6 space-y-6">
             {/* Game Status Header */}
-            <div className="bg-white/30 backdrop-blur-sm rounded-lg p-4 border border-white/20">
+            <div className="bg-white/20 backdrop-blur-sm rounded-lg p-4 border border-white/20">
               <div className="flex items-center justify-between mb-4">
                 <h3 className="text-lg font-medium text-white">Game Status</h3>
                 {!isMobile && (
@@ -819,7 +832,7 @@ const Game: React.FC = () => {
             </div>
 
             {/* Context Usage */}
-            <div className="bg-white/30 backdrop-blur-sm rounded-lg p-4 border border-white/20">
+            <div className="bg-white/20 backdrop-blur-sm rounded-lg p-4 border border-white/20">
               <div className="flex items-center gap-2 mb-4">
                 <Activity className="w-5 h-5 text-purple-300" />
                 <h4 className="text-white font-medium">Context Usage</h4>
@@ -834,7 +847,7 @@ const Game: React.FC = () => {
             </div>
 
             {/* Current Scene */}
-            <div className="bg-white/30 backdrop-blur-sm rounded-lg p-4 border border-white/20">
+            <div className="bg-white/20 backdrop-blur-sm rounded-lg p-4 border border-white/20">
               <div className="flex items-center gap-2 mb-4">
                 <MapPin className="w-5 h-5 text-purple-300" />
                 <h4 className="text-white font-medium">Current Scene</h4>
@@ -862,7 +875,7 @@ const Game: React.FC = () => {
             </div>
 
             {/* Characters Present */}
-            <div className="bg-white/30 backdrop-blur-sm rounded-lg p-4 border border-white/20">
+            <div className="bg-white/20 backdrop-blur-sm rounded-lg p-4 border border-white/20">
               <div className="flex items-center justify-between mb-4">
                 <div className="flex items-center gap-2">
                   <Users className="w-5 h-5 text-purple-300" />
@@ -889,7 +902,7 @@ const Game: React.FC = () => {
             </div>
 
             {/* Story Freedom */}
-            <div className="bg-white/30 backdrop-blur-sm rounded-lg p-4 border border-white/20">
+            <div className="bg-white/20 backdrop-blur-sm rounded-lg p-4 border border-white/20">
               <div className="flex items-center gap-2 mb-4">
                 <Sparkles className="w-5 h-5 text-purple-300" />
                 <h4 className="text-white font-medium">Story Freedom</h4>
@@ -897,7 +910,7 @@ const Game: React.FC = () => {
               <div className="relative">
                 <button
                   onClick={() => setStoryFreedomOpen(!storyFreedomOpen)}
-                  className="w-full p-3 bg-white/30 border border-white/30 rounded text-left text-white hover:bg-white/40 transition-colors flex items-center justify-between cursor-pointer"
+                  className="w-full p-3 bg-white/20 border border-white/30 rounded text-left text-white hover:bg-white/30 transition-colors flex items-center justify-between cursor-pointer"
                 >
                   <div>
                     <div className="font-medium">{creativityDisplay.name}</div>
@@ -910,7 +923,7 @@ const Game: React.FC = () => {
                 </button>
                 
                 {storyFreedomOpen && (
-                  <div className="absolute top-full left-0 right-0 mt-1 bg-white/30 backdrop-blur-sm border border-white/30 rounded-lg z-10 shadow-xl">
+                  <div className="absolute top-full left-0 right-0 mt-1 bg-white/20 backdrop-blur-sm border border-white/30 rounded-lg z-10 shadow-xl">
                     {[
                       { key: 'faithful', name: 'Story-Focused', description: 'Staying true to the original narrative' },
                       { key: 'balanced', name: 'Flexible Exploration', description: 'Balanced adventure with creative possibilities' },
@@ -942,9 +955,13 @@ const Game: React.FC = () => {
           storyTitle={story.title}
           characterName={character.name}
           memoryEvents={memoryEvents}
-          totalConversations={messages.filter(m => m.message_type === 'user').length}
+          relationships={relationships}
+          worldState={worldState}
         />
       )}
+
+      {/* Auto-save indicator */}
+      <AutoSaveIndicator status={autoSaveStatus} />
     </div>
   );
 };
